@@ -1,0 +1,516 @@
+#!/usr/bin/env python
+
+import sys, socket, select, time, json, random
+
+my_id = sys.argv[1]
+
+replica_ids = sys.argv[2:]
+
+
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+sock.connect(my_id)
+
+
+
+
+num_replicas = len(sys.argv) - 1
+
+LEADER = 'leader'
+CANDIDATE = 'candidate'
+FOLLOWER = 'follower'
+
+
+class Replica:
+  def __init__(self, my_id, replica_ids):
+    self.my_id = my_id
+    self.replica_ids = replica_ids
+    self.leader = 'FFFF' 
+    self.state = FOLLOWER
+
+    #Log and state machine
+    self.log = [{'term': 0}] 
+    self.store = {} 
+    self.commit_index = 0
+    self.last_applied = 0
+
+    #Information for sending appendEntryRPC's as leader
+    self.current_entry = None
+    self.current_entry_mid = None
+    self.current_entry_oks = set()
+    self.current_time = time.time()
+    self.retry_timeout = 0.1
+
+    #Voting
+    self.received_votes = set() 
+    self.vote_requests = {} 
+    self.current_term = 0 
+    self.voted_for = {}
+    self.election_timeout = (150 + (random.random() * 150)) * 0.001
+    self.timer_start = time.time()
+
+    #messages to send/receive
+    self.inbox = [] 
+    self.outbox_client = [] 
+    self.outbox_replica = [] 
+
+
+
+
+    #VOLATILE STATE
+    self.next_index = {}
+    self.match_index = {}
+    self.replica_timeouts = {}
+
+
+  def read_msg(self, sock):
+    """
+      receive a single message from socket
+    """
+    ready = select.select([sock], [], [], 0.000001)[0]
+    msg = None
+    if sock in ready:
+      msg_raw = sock.recv(100000)
+      if len(msg_raw) == 0: 
+        return None
+      msg = json.loads(msg_raw)
+    return msg
+
+  def read_all_msg(self, sock):
+    """
+      receive all messages readable from socket
+    """
+    while True:
+      msg = self.read_msg(sock)
+      if not msg:
+        return
+      else: 
+        self.inbox.append(msg)
+
+
+  def send_message(self, sock, msg):
+    """
+      send a message through socket
+    """
+    return sock.send(msg)
+
+  def add_req_fields(self, msg, dst, msgtype):
+    """
+      adds destination, source, type, self id, and leader to message
+    """
+    msg['src'] = self.my_id
+    msg['dst'] = dst
+    msg['leader'] = self.leader
+    msg['type'] = msgtype
+    return msg
+
+  def redirect(self, msg):
+    """
+      Send redirect message to client to inform about leader
+    """
+    resp = {'MID': msg['MID']}
+    resp = self.add_req_fields(resp, self.my_id, 'redirect')
+    return self.outbox_client.append(json.dumps(resp))
+
+
+  #Election methods
+
+  def start_election(self):
+    """
+      follower to candidate, increment term, send requests to vote
+    """
+    self.state = CANDIDATE 
+    self.current_term = self.current_term + 1
+    self.election_timeout = (150 + (random.random() * 150)) * 0.001
+    self.timer_start = time.time()
+    self.voted_for[self.current_term] = self.my_id
+    self.received_votes = set([self.my_id])
+    for repid in self.replica_ids:
+      self.replica_timeouts[repid] = {'to': self.retry_timeout, 'last': 0}
+      req = {'term': self.current_term, 'candidate_id': self.my_id, 'last_log_index': len(self.log) - 1, 'last_log_term':self.log[-1]['term']}
+      req = self.add_req_fields(req, repid, 'request_vote')
+      self.vote_requests[repid] = json.dumps(req)
+    return
+
+  def become_leader(self):
+    """
+      From candidate to leader upon election success
+      update nextIndex and matchIndex
+      reset voting information
+      send AppendEntryRPCs
+    """
+    self.state = LEADER
+    self.leader = self.my_id
+    self.vote_requests = {}
+    self.received_votes = set()
+    for repid in self.replica_ids:
+      self.replica_timeouts[repid] = {'to': self.retry_timeout, 'last': 0}
+      self.next_index[repid] = len(self.log)
+      self.match_index[repid] = 0
+      req = {'term': self.current_term, 'leader_id': self.leader, 'prev_log_index': 0, 'prev_log_term': 0, 'entries': [], 'leader_commit': self.commit_index}
+      req = self.add_req_fields(req, repid, 'append')
+
+  def leader_to_follower(self, new_term, new_leader):
+    """
+      Turn from leader to follower, revert all volatile states
+    """
+    self.next_index = {}
+    self.match_index = {}
+    self.replica_timeouts = {}
+    self.state = FOLLOWER
+    self.current_term = new_term
+    self.leader = new_leader
+    self.timer_start = time.time()
+    if self.current_entry:
+      self.redirect(self.current_entry)
+
+    self.current_entry = None
+    self.current_entry_mid = None
+    self.current_entry_oks = set()
+    return
+
+  def candidate_to_follower(self, new_term, new_leader):
+    """
+      Turn from candidate to follower and halt your own election
+    """
+    self.state = FOLLOWER
+    self.leader = new_leader
+    self.vote_requests = {}
+    self.received_votes = set()
+    self.current_term = new_term
+    self.timer_start = time.time()
+    
+  #Log replication
+
+  def leader_get(self, msg):
+    """
+      Respond to a client's get request as a leader
+    """
+    value = self.store.get(msg['key'], "")
+    resp = {'value': value, 'key': msg['key'], 'MID': msg['MID']}
+    resp = self.add_req_fields(resp, msg['src'], 'ok')
+    return self.outbox_client.append(json.dumps(resp))
+
+  def leader_put(self, msg):
+    """
+      Handle client's put resposne
+      Append the message to own log
+      Will send out AppendEntryRPCs in next loop execution
+    """
+    new_entry = {'client': msg['src'], 'key': msg['key'], 'value': msg['value'], 'dstMID': msg['MID'], 'term': self.current_term}
+    self.log.append(new_entry)
+    for timeout in self.replica_timeouts.values():
+      timeout['last'] = 0
+    self.current_entry = msg
+    self.current_entry_mid = msg['MID']
+    self.current_entry_oks = set([self.my_id])
+    self.current_time = time.time()
+
+      
+  def create_append_entry_rpc(self, repid):
+    """
+      Create AppendEntryRPC for a given replicaId
+    """
+    to_append = {'term': self.current_term, 'leader_id': self.leader, 'prev_log_index': self.next_index[repid] - 1, 'prev_log_term': self.log[self.next_index[repid] - 1]['term'], 'leader_commit': self.commit_index}
+    entries = [] if self.next_index[repid] >= len(self.log) else self.log[self.next_index[repid]:]
+    if len(entries) > 50:
+      entries = entries[0:50]
+    elif self.current_entry_mid:
+      to_append['dstMID'] = self.current_entry_mid
+    to_append['entries'] = entries
+    to_append = self.add_req_fields(to_append, repid, 'append')
+    return json.dumps(to_append)
+
+  def follower_handle_append(self, msg):
+    """
+      Handle appendEntryRPC as a follower
+    """
+    self.timer_start = time.time() 
+    if msg['term'] < self.current_term or msg['prev_log_index'] >= len(self.log) or msg['prev_log_term'] !=self.log[msg['prev_log_index']]['term']:
+      resp = {'term': self.current_term, 'success': False, 'nextIndex': self.commit_index}
+      if msg.get('dstMID'): 
+        resp['dstMID'] = msg['dstMID']
+      resp = self.add_req_fields(resp, msg['src'], 'append_response')
+      self.outbox_replica.append(json.dumps(resp))
+    else: 
+      self.leader = msg['leader']
+      self.current_term = msg['term']
+      if len(msg['entries']) > 0: 
+        self.log =self.log[0:msg['prev_log_index'] + 1]
+        for entry in msg['entries']:
+          self.log.append(entry)
+      if msg['leader_commit'] > self.commit_index:
+        self.commit_index = min(msg['leader_commit'], len(self.log) - 1)
+        while self.commit_index > self.last_applied: 
+          self.last_applied = self.last_applied + 1
+          self.store[self.log[self.last_applied]['key']] =self.log[self.last_applied]['value']
+      res = {'term': self.current_term, 'success': True, 'nextIndex': len(self.log)}
+      if msg.get('dstMID'):
+        res['dstMID'] = msg['dstMID']
+      res = self.add_req_fields(res, msg['src'], 'append_response')
+      self.outbox_replica.append(json.dumps(res))
+
+  def follower_handle_vote_request(self, msg):
+    """
+      Handle vote request as a follower
+      1. Check that candidate log entry is at least as up to date as yours
+      2. if you haven't voted this term, vote for candidate
+    """
+    if self.current_term > msg['term']:
+      res = {'term': self.current_term, 'success': False}
+      res = self.add_req_fields(res, msg['src'], 'vote_response')
+      self.outbox_replica.append(json.dumps(res))
+    
+    else:
+      self.current_term = msg['term']
+      self.leader = 'FFFF' 
+      if self.voted_for.get(self.current_term, msg['candidate_id']) == msg['candidate_id']:
+        my_last_term = self.log[-1]['term']
+        if msg['last_log_term'] > my_last_term or msg['last_log_index'] >= len(self.log) - 1:
+          self.voted_for[self.current_term] = msg['candidate_id']
+          res = {'success': True, 'term': self.current_term}
+          res = self.add_req_fields(res, msg['src'], 'vote_response')
+          self.outbox_client.append(json.dumps(res))
+        else: 
+          res = {'success': False, 'term': self.current_term}
+          res = self.add_req_fields(res, msg['src'], 'vote_response')
+          self.outbox_client.append(json.dumps(res))
+
+  #Apply logs to store
+
+  def follower_inbox(self):
+    """
+      Handle follower's inbox messages (AppendEntryRPC, vote requests, client puts/gets)
+    """
+    if len(self.inbox) == 0: 
+      return
+
+    queue = []
+
+    while len(self.inbox) > 0:
+      msg = self.inbox.pop(0) 
+
+      if msg['type'] in ['get', 'put']:
+        if self.leader == 'FFFF':
+          queue.append(msg) 
+        else:
+          res = {'MID': msg['MID']}
+          res = self.add_req_fields(res, msg['src'], 'redirect')
+          self.outbox_client.append(json.dumps(res))
+
+      elif msg['type'] == 'append':
+        self.follower_handle_append(msg)
+
+      elif msg['type'] == 'request_vote':
+        self.follower_handle_vote_request(msg)
+        
+
+
+      elif msg['type'] == 'vote_response' or msg['type'] == 'append_response':
+        if msg['term'] > self.current_term:
+          leader = msg['leader']
+          self.current_term = msg['term']
+
+    self.inbox = queue
+
+  def increment_last_applied(self):
+    """
+      In the case commit index > applied index, increment applied index and apply that log entry to state machine
+    """
+    self.last_applied = self.last_applied + 1
+    self.store[self.log[self.last_applied]['key']] =self.log[self.last_applied]['value']
+    res = {'MID':self.log[self.last_applied]['dstMID']}
+    res = self.add_req_fields(res, self.log[self.last_applied]['client'], "ok")
+    self.outbox_client.append(json.dumps(res))
+
+  def leader_inbox(self):
+    """
+      Handle messages sent to leader's inbox (client get/put requests, responses to appendEntryRPC, voteRequests, other appendEntryRPCs etc)
+    """
+
+    if len(self.inbox) == 0: return
+
+    queue = []
+
+    
+    while len(self.inbox) > 0:
+      msg = self.inbox.pop(0)
+      
+      if msg['type'] in ['get', 'put']:
+        if self.current_entry:
+          queue.append(msg)
+        else:
+          if msg['type'] == 'get':
+            self.leader_get(msg)
+          else:
+            self.leader_put(msg)
+      elif msg['type'] == 'append':
+        if self.current_term < msg['term']:
+          self.leader_to_follower(msg['term'], msg['leader']) 
+          self.inbox.extend(queue + [msg])
+          return self.follower_inbox()
+
+        else:
+          res = {'term': self.current_term, 'success': False}
+          res = self.add_req_fields(res, msg['src'], 'append_response')
+          self.outbox_replica.append(json.dumps(res))
+      elif msg['type'] == 'append_response':
+        self.replica_timeouts[msg['src']]['last'] = time.time()
+
+        if self.current_term < msg['term']:
+          self.leader_to_follower(msg['term'], msg['leader'])
+          self.inbox.extend(queue)
+          return self.follower_inbox()
+
+        elif msg['success'] == False: 
+          self.next_index[msg['src']] = msg['nextIndex'] 
+        else:
+          next_idx_temp = min(msg['nextIndex'], len(self.log))
+          self.next_index[msg['src']] = next_idx_temp
+          self.match_index[msg['src']] = next_idx_temp - 1
+
+          if self.current_entry_mid:
+            if msg.get('dstMID') == self.current_entry_mid:
+              self.current_entry_oks.add(msg['src'])
+              if (num_replicas / 2.0) < len(self.current_entry_oks): 
+                self.commit_index = len(self.log) - 1
+
+                self.current_entry = None
+                self.current_entry_mid = None
+                self.current_entry_oks = set()
+
+        while self.last_applied < self.commit_index:
+          self.increment_last_applied()
+
+      elif msg['type'] == 'request_vote':
+
+        if self.current_term < msg['term']:
+          self.leader_to_follower(msg['term'], msg['leader'])
+          self.inbox.extend(queue + [msg])
+          return self.follower_inbox()
+        else:
+          res = {'term': self.current_term, 'success': False}
+          res = self.add_req_fields(res, msg['src'], 'vote_response')
+          self.outbox_replica.append(json.dumps(res))
+      elif msg['type'] == 'vote_response':
+        if self.current_term < msg['term']:
+          self.leader_to_follower(msg['term'], msg['leader'])
+          self.inbox = self.inbox + queue
+          return self.follower_inbox()
+
+    self.inbox = queue
+
+  def replica_timedout(self, repid): #Check when each replica needs another heartbeat
+    return (time.time() > self.replica_timeouts[repid]['to'] + self.replica_timeouts[repid]['last'])
+
+
+  def candidate_inbox(self):
+    """
+      Handle messages sent to candidate's inbox (mostly vote requests)
+    """
+    if len(self.inbox) == 0: return
+
+    queue = []
+
+    while len(self.inbox) > 0:
+      msg = self.inbox.pop(0)
+      
+
+      if msg['type'] == 'vote_response':
+        
+        if self.current_term < msg['term']:
+          self.candidate_to_follower(msg['term'], msg['leader'])
+          self.inbox = self.inbox + queue
+          return self.follower_inbox()
+      
+        if msg['term'] == self.current_term and msg['success'] == True: 
+          self.received_votes.add(msg['src'])
+          if msg['src'] in self.vote_requests:
+            self.vote_requests.pop(msg['src'])
+          if len(self.received_votes) > (num_replicas / 2.0):
+            self.become_leader()
+            self.inbox = self.inbox + queue
+            return self.leader_inbox()  
+      elif msg['type'] == 'request_vote':
+        
+        if msg['term'] > self.current_term:           
+          self.candidate_to_follower(msg['term'], msg['leader'])
+          self.inbox.extend(queue + [msg])
+          return self.follower_inbox() 
+
+        else:
+          res = {'term': self.current_term, 'success': False}
+          res = self.add_req_fields(res, msg['src'], 'vote_response')
+          self.outbox_replica.append(json.dumps(res))
+      elif msg['type'] == 'append':
+
+        if self.current_term <= msg['term']:
+          self.candidate_to_follower(msg['term'], msg['leader'])
+          self.inbox.extend(queue + [msg])
+          return self.follower_inbox()
+
+        else:
+          res = {'term': self.current_term, 'success': False}
+          res = self.add_req_fields(res, msg['src'], 'append_response')
+          self.outbox_replica.append(json.dumps(res))
+      elif msg['type'] == 'append_response':
+
+        if self.current_term <= msg['term']:
+          self.candidate_to_follower(msg['term'], msg['leader'])
+          self.inbox.extend(queue)
+          return self.follower_inbox() 
+      elif msg['type'] == 'get' or msg['type'] == 'put':
+        queue.append(msg) 
+
+    self.inbox = queue 
+
+  def send_replica_messages(self):
+    for msg in self.outbox_replica:
+      self.send_message(sock, msg)
+    self.outbox_replica = []
+
+  def send_client_messages(self):
+    for msg in self.outbox_client:
+      self.send_message(sock, msg)
+    self.outbox_client = []
+
+
+  def run(self):
+    
+    while True:
+
+      self.send_client_messages()
+
+      self.send_replica_messages()
+    
+      if self.state == CANDIDATE:
+        currTime = time.time()
+        for repid in replica_ids:
+          if (currTime > self.replica_timeouts[repid]['last'] + self.replica_timeouts[repid]['to']) and self.vote_requests.get(repid): 
+            self.send_message(sock, self.vote_requests[repid])
+            self.replica_timeouts[repid]['last'] = currTime
+
+      elif self.state == LEADER:
+        for repid in replica_ids:
+          if self.replica_timedout(repid):
+            self.send_message(sock, self.create_append_entry_rpc(repid))
+            self.replica_timeouts[repid]['last'] = time.time()
+
+      self.read_all_msg(sock)
+      
+      if self.state == CANDIDATE:
+        self.candidate_inbox()
+      elif self.state == LEADER:
+        self.leader_inbox()
+      elif self.state == FOLLOWER:
+        self.follower_inbox()
+
+      if self.state != LEADER and time.time() > self.election_timeout + self.timer_start: #Timed out
+        self.start_election()
+
+if __name__ == "__main__":
+    my_replica = Replica(my_id, replica_ids)
+    my_replica.run()
+
+
+
+
